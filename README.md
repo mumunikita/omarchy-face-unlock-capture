@@ -56,7 +56,7 @@ Face unlock only works with the lid **open** on a laptop: the IR camera is physi
 Run as your normal user. The installer asks for `sudo` only for system files:
 
 ```bash
-git clone https://github.com/<your-user>/omarchy-face-unlock-capture.git
+git clone https://github.com/mumunikita/omarchy-face-unlock-capture.git
 cd omarchy-face-unlock-capture
 ./install.sh
 ```
