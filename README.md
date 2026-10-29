@@ -51,6 +51,8 @@ The watcher uses the same three-failure window as the lock screen. The photo tri
 
 Face unlock only works with the lid **open** on a laptop: the IR camera is physically in the lid. Howdy is configured with `abort_if_lid_closed = true`.
 
+> Already using `io.github.tslove923.howdy-face-unlock`? It is **not required** here. This project patches the GrantAbell clone and uses the same dedicated `/etc/pam.d/omarchy-lock-howdy` service, so both can coexist; the other plugin may simply report health for the stock lock, which this setup does not use.
+
 ## Install
 
 Run as your normal user. The installer asks for `sudo` only for system files:
