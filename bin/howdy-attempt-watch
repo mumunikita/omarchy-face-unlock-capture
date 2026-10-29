@@ -1,0 +1,94 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Watch Howdy's PAM module on the lock screen and, after the lock screen's
+# three failed face attempts, take a photo of whoever is in front of the
+# machine. The photo deliberately runs after the last attempt: capturing
+# earlier would hold the IR camera and could eat the third face try.
+#
+# Tested with howdy-next 3.4.2. It logs one line per attempt, tagged with the
+# PAM service:
+#   pam_howdy(omarchy-lock-howdy:auth): Face verification timed out
+#   pam_howdy(omarchy-lock-howdy:auth): Face verification failed: ...
+#   pam_howdy(omarchy-lock-howdy:auth): Child killed by signal ...
+#   pam_howdy(omarchy-lock-howdy:auth): Face verification succeeded
+# Filtering on the service name keeps sudo/polkit attempts out of the count.
+set -u
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/howdy-failed-attempts"
+counts="$state_dir/failures"
+capture="${HOWDY_ATTEMPT_CAPTURE:-$HOME/.local/bin/howdy-attempt-capture}"
+attempts=3
+window=30 # seconds; three failed scans with retries take ~10-15s
+# The capture opens the same IR device Howdy scans with. It now runs after the
+# final (third) failure, when Howdy has stopped retrying, so it cannot consume
+# another face attempt. The cooldown is a safety net for any late retry.
+cooldown=6
+last_capture=0
+mkdir -p "$state_dir" || exit 1
+chmod 700 "$state_dir" 2>/dev/null
+: > "$counts" || exit 1
+
+log() { logger -t howdy-attempt-watch "$*"; }
+
+if ! journalctl -n0 >/dev/null 2>&1; then
+  log "cannot read the system journal; add $USER to the systemd-journal group"
+  exit 1
+fi
+if [[ ! -x $capture ]]; then
+  log "capture helper not found or not executable: $capture"
+  exit 1
+fi
+
+record_failure() {
+  local now n
+  now=$(date +%s)
+  if ((now - last_capture < cooldown)); then
+    log "ignoring failure during capture cooldown"
+    return
+  fi
+  {
+    awk -v n="$now" -v w="$window" 'NF && $1 >= n - w' "$counts" 2>/dev/null
+    echo "$now"
+  } > "$counts.tmp" && mv "$counts.tmp" "$counts"
+  n=$(wc -l < "$counts")
+  log "face failure $n in ${window}s window"
+  if ((n >= attempts)); then
+    : > "$counts"
+    last_capture=$now
+    log "$attempts failed attempts, saving an IR photo"
+    "$capture" &
+  fi
+}
+
+# Reset the streak when the session actually unlocks: a face success logs its
+# own line, but password/fingerprint unlock does not go through this PAM
+# config, so watch the lock state too.
+(
+  was_locked=false
+  while sleep 2; do
+    locked=$(omarchy-shell lock isLocked 2>/dev/null)
+    if [[ $locked == true ]]; then
+      was_locked=true
+    elif [[ $was_locked == true ]]; then
+      : > "$counts"
+      was_locked=false
+      log "unlocked, counter reset"
+    fi
+  done
+) &
+poll_pid=$!
+trap 'kill "$poll_pid" 2>/dev/null; exit 0' TERM INT
+
+log "watching lock-screen face attempts"
+while IFS= read -r line; do
+  case "$line" in
+    *"pam_howdy(omarchy-lock-howdy:auth): Face verification succeeded"*)
+      : > "$counts"
+      ;;
+    *"pam_howdy(omarchy-lock-howdy:auth): Face verification timed out"* | \
+      *"pam_howdy(omarchy-lock-howdy:auth): Face verification failed"* | \
+      *"pam_howdy(omarchy-lock-howdy:auth): Child killed by signal"*)
+      record_failure
+      ;;
+  esac
+done < <(journalctl -f -n0 -o cat)

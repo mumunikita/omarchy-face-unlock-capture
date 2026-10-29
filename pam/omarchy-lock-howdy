@@ -1,0 +1,6 @@
+#%PAM-1.0
+# managed by omarchy-face-unlock-capture
+# Dedicated PAM service used only by the lock screen's Howdy PamContext.
+# pam_howdy is run directly; password/fingerprint have their own services.
+auth       required                    pam_howdy.so
+account    include                     system-local-login

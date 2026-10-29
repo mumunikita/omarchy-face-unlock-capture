@@ -1,0 +1,109 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Interactive setup for Telegram delivery of lock-attempt photos.
+#
+# 1. In Telegram, talk to @BotFather: /newbot, pick a name and username.
+# 2. Run this script and paste the bot token (input is hidden).
+# 3. Send any message to your new bot, then let the script auto-detect the chat,
+#    or paste a numeric chat ID / @channel username yourself.
+set -euo pipefail
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/howdy-attempt-capture"
+env_file="$config_dir/telegram.env"
+mkdir -p "$config_dir"
+chmod 700 "$config_dir"
+
+printf 'Telegram bot token (from @BotFather): '
+IFS= read -rs token
+echo
+
+if [[ -z $token ]]; then
+  echo "No token entered." >&2
+  exit 1
+fi
+
+# Telegram's Bot API is normally reached through api.telegram.org.  Some
+# networks blackhole the address DNS returns while another Telegram address
+# still works; try the normal route, then pin a known-good one if needed.
+api_ip=""
+resolve_args=()
+
+check_me() {
+  local ip="$1"
+  local args=()
+  [[ -n $ip ]] && args=(--resolve "api.telegram.org:443:$ip")
+  curl -4 -sS --max-time 12 "${args[@]}" \
+    "https://api.telegram.org/bot$token/getMe" 2>/dev/null || true
+}
+
+me=$(check_me "")
+if ! jq -e '.ok == true' >/dev/null 2>&1 <<<"$me"; then
+  me=$(check_me "149.154.167.220")
+  if jq -e '.ok == true' >/dev/null 2>&1 <<<"$me"; then
+    api_ip="149.154.167.220"
+    resolve_args=(--resolve "api.telegram.org:443:$api_ip")
+    echo "Using alternate Telegram API address $api_ip (DNS route is blocked)."
+  fi
+fi
+
+if ! jq -e '.ok == true' >/dev/null 2>&1 <<<"$me"; then
+  echo "Cannot reach api.telegram.org. Check your internet/VPN/proxy and try again." >&2
+  exit 1
+fi
+bot_username=$(jq -r '.result.username // "unknown"' <<<"$me")
+echo "Bot: @$bot_username"
+
+printf 'Chat ID (leave empty to detect from the latest message to the bot): '
+IFS= read -r chat
+
+if [[ -z $chat ]]; then
+  echo "Send any message to @$bot_username in Telegram, then press Enter here."
+  IFS= read -r _
+  updates=$(curl -4 -sS --max-time 20 "${resolve_args[@]}" \
+    "https://api.telegram.org/bot$token/getUpdates" 2>/dev/null || true)
+  chat=$(jq -r '
+    [.result[]? |
+      (.message // .channel_post // .edited_message // .my_chat_member) |
+      .chat |
+      select(. != null) |
+      {id: .id, title: (.title // .username // .first_name // "chat")}
+    ] | last // empty | "\(.id)"
+  ' <<<"$updates" 2>/dev/null || true)
+  if [[ -z $chat ]]; then
+    echo "No chat found. Open @$bot_username, press Start/send a message, then try again." >&2
+    exit 1
+  fi
+  title=$(jq -r '
+    [.result[]? |
+      (.message // .channel_post // .edited_message // .my_chat_member) |
+      .chat |
+      select(. != null) |
+      {id: .id, title: (.title // .username // .first_name // "chat")}
+    ] | last // empty | "\(.title)"
+  ' <<<"$updates" 2>/dev/null || true)
+  echo "Detected chat: ${title:-$chat} ($chat)"
+fi
+
+umask 077
+{
+  printf 'TELEGRAM_BOT_TOKEN=%s\n' "$token"
+  printf 'TELEGRAM_CHAT_ID=%s\n' "$chat"
+  [[ -n $api_ip ]] && printf 'TELEGRAM_API_IP=%s\n' "$api_ip"
+} > "$env_file"
+chmod 600 "$env_file"
+
+echo "Saved $env_file (mode 600)."
+
+# Prove the chat works before relying on it at the lock screen.
+test_response=$(curl -4 -sS --max-time 20 "${resolve_args[@]}" \
+  -d "chat_id=$chat" \
+  --data-urlencode "text=Howdy lock-attempt photos are connected." \
+  "https://api.telegram.org/bot$token/sendMessage" 2>/dev/null || true)
+
+if jq -e '.ok == true' >/dev/null 2>&1 <<<"$test_response"; then
+  echo "Test message sent. The next captured lock-screen photo will arrive here."
+else
+  echo "Saved, but the test message failed:" >&2
+  jq -r '.description // "unknown Telegram error"' <<<"$test_response" >&2 || true
+  exit 1
+fi

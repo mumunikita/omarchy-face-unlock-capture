@@ -1,0 +1,74 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Send a lock-attempt photo to a Telegram chat through a bot.
+#
+# Credentials live outside this script, in a 0600 file:
+#   ~/.config/howdy-attempt-capture/telegram.env
+# with:
+#   TELEGRAM_BOT_TOKEN=123456:ABC...
+#   TELEGRAM_CHAT_ID=123456789
+#   TELEGRAM_API_IP=149.154.167.220   # optional; for networks that block
+#                                     # the IP DNS returns for api.telegram.org
+#
+# Run `howdy-attempt-telegram-setup` to create that file interactively.
+set -u
+
+photo="${1:-}"
+[[ -n $photo && -f $photo ]] || exit 0
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/howdy-attempt-capture"
+env_file="$config_dir/telegram.env"
+[[ -r $env_file ]] || {
+  logger -t howdy-attempt-telegram "not configured; photo kept locally"
+  exit 0
+}
+
+# Never leave the token world-readable, even if it was created by hand.
+chmod 600 "$env_file" 2>/dev/null
+chmod 700 "$config_dir" 2>/dev/null
+
+token=""
+chat=""
+api_ip=""
+while IFS='=' read -r key value; do
+  case "$key" in
+    TELEGRAM_BOT_TOKEN) token=$value ;;
+    TELEGRAM_CHAT_ID) chat=$value ;;
+    TELEGRAM_API_IP) api_ip=$value ;;
+  esac
+done < "$env_file"
+
+if [[ -z $token || -z $chat ]]; then
+  logger -t howdy-attempt-telegram "telegram.env is missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID"
+  exit 0
+fi
+
+# Some networks resolve api.telegram.org to an address that is blackholed
+# while another Telegram Bot API address still works.  Pin the working one
+# when telegram.env provides TELEGRAM_API_IP.
+resolve_args=()
+[[ -n $api_ip ]] && resolve_args=(--resolve "api.telegram.org:443:$api_ip")
+
+caption="Lock screen face attempt on $(hostname) at $(date '+%Y-%m-%d %H:%M:%S')"
+api="https://api.telegram.org/bot$token/sendPhoto"
+
+for attempt in 1 2 3; do
+  response=$(curl -4 -sS --max-time 30 \
+    "${resolve_args[@]}" \
+    -F "chat_id=$chat" \
+    -F "caption=$caption" \
+    -F "photo=@$photo" \
+    "$api" 2>/dev/null) || response=""
+
+  if jq -e '.ok == true' >/dev/null 2>&1 <<<"$response"; then
+    logger -t howdy-attempt-telegram "sent $(basename "$photo") to Telegram"
+    exit 0
+  fi
+
+  detail=$(jq -r '.description // empty' <<<"$response" 2>/dev/null || true)
+  logger -t howdy-attempt-telegram \
+    "Telegram send failed (attempt $attempt/3)${detail:+: $detail}"
+  ((attempt < 3)) && sleep 3
+done
+
+exit 1

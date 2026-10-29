@@ -1,0 +1,47 @@
+name: shellcheck
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Bash syntax
+        run: |
+          bash -n install.sh
+          bash -n uninstall.sh
+          bash -n bin/howdy-attempt-watch
+          bash -n bin/howdy-attempt-capture
+          bash -n bin/howdy-attempt-telegram
+          bash -n bin/howdy-attempt-telegram-setup
+          bash -n bin/howdy-lock-verify
+          bash -n scripts/detect-ir-camera
+
+      - name: ShellCheck
+        run: |
+          shellcheck -x \
+            install.sh \
+            uninstall.sh \
+            bin/howdy-attempt-watch \
+            bin/howdy-attempt-capture \
+            bin/howdy-attempt-telegram \
+            bin/howdy-attempt-telegram-setup \
+            bin/howdy-lock-verify \
+            scripts/detect-ir-camera
+
+      - name: Python syntax
+        run: |
+          python3 -m py_compile \
+            bin/grantabell-howdy-patch \
+            scripts/configure-howdy.py

@@ -1,0 +1,14 @@
+[Unit]
+Description=Capture an IR photo after three failed lock-screen face attempts
+Documentation=file:@BIN_DIR@/howdy-attempt-watch
+After=graphical-session.target
+
+[Service]
+Type=simple
+EnvironmentFile=-@CONFIG_DIR@/capture.env
+ExecStart=@BIN_DIR@/howdy-attempt-watch
+Restart=always
+RestartSec=5s
+
+[Install]
+WantedBy=default.target

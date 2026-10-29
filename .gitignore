@@ -1,0 +1,19 @@
+# Secrets and local runtime files
+telegram.env
+capture.env
+state/
+photos/
+
+# Backups and generated files
+*.bak
+*.bak.*
+*.tmp
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Editors and OS metadata
+.DS_Store
+.idea/
+.vscode/

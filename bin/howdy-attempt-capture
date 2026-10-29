@@ -1,0 +1,93 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Save one frame from the infrared camera after a burst of failed face unlocks.
+#
+# The IR camera is the same node Howdy itself uses (device_path in
+# /etc/howdy/config.ini), so there is no separate color stream involved. It
+# only offers 8-bit greyscale at 640x360 on this hardware.
+set -u
+umask 077
+
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/howdy-failed-attempts"
+photo_dir="${HOWDY_ATTEMPT_PHOTO_DIR:-$HOME/Pictures/lock-attempts}"
+mkdir -p "$state_dir" "$photo_dir" || exit 1
+chmod 700 "$state_dir" "$photo_dir" 2>/dev/null
+
+# Use the exact device Howdy is configured with. The kernel renumbers
+# /dev/videoN across reboots, so the config's stable /dev/v4l/by-path path is
+# preferred. If it is unavailable, find the node that advertises only GREY,
+# which is how these Windows-Hello-style IR sensors identify themselves.
+find_ir_camera() {
+  local cfg=/etc/howdy/config.ini dev d fmts
+  if [[ -r $cfg ]]; then
+    dev=$(awk -F= '/^[[:space:]]*device_path[[:space:]]*=/{
+      v = $2; gsub(/^[ \t]+|[ \t]+$/, "", v); print v; exit
+    }' "$cfg")
+    if [[ -n ${dev:-} && -c $dev ]]; then
+      echo "$dev"
+      return 0
+    fi
+  fi
+  for d in /dev/video*; do
+    [[ -c $d ]] || continue
+    fmts=$(timeout 2 v4l2-ctl -d "$d" --list-formats 2>/dev/null |
+      grep -oE "'[A-Z0-9]{4}'" | tr -d "'")
+    if [[ $(wc -l <<<"$fmts") -eq 1 && $fmts == "GREY" ]]; then
+      echo "$d"
+      return 0
+    fi
+  done
+  return 1
+}
+
+camera=$(find_ir_camera) || {
+  logger -t howdy-attempt-capture "no infrared camera found"
+  exit 1
+}
+
+stamp=$(date +%Y-%m-%d_%H-%M-%S)
+out="$photo_dir/$stamp.jpg"
+
+capture() {
+  timeout 10 ffmpeg -hide_banner -loglevel error -f v4l2 "$@" \
+    -i "$camera" -frames:v 1 -y "$out" >/dev/null 2>&1
+}
+
+# Howdy holds this same device for each 4-second scan and retries quickly, so
+# a capture can land on a busy node. Give the gap a few chances before
+# falling back to a plain default-format grab.
+saved=false
+for _ in 1 2 3 4 5 6 7 8; do
+  if capture -input_format gray -video_size 640x360; then
+    saved=true
+    break
+  fi
+  rm -f "$out"
+  sleep 0.3
+done
+if [[ $saved != true ]] && capture; then
+  saved=true
+fi
+if [[ $saved != true ]]; then
+  rm -f "$out"
+  logger -t howdy-attempt-capture "failed to capture from $camera"
+  exit 1
+fi
+
+chmod 600 "$out"
+logger -t howdy-attempt-capture "saved $out"
+
+# Telegram is optional: the sender logs and exits cleanly when unconfigured.
+telegram="$HOME/.local/bin/howdy-attempt-telegram"
+if [[ -x $telegram ]]; then
+  "$telegram" "$out" || true
+fi
+
+# Keep the newest 100 photos.
+mapfile -t photos < <(
+  find "$photo_dir" -maxdepth 1 -type f -name '*.jpg' -printf '%T@ %p\n' |
+    sort -rn | cut -d' ' -f2-
+)
+if ((${#photos[@]} > 100)); then
+  printf '%s\n' "${photos[@]:100}" | xargs -r rm -f --
+fi

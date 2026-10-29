@@ -1,0 +1,45 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Print the first infrared camera device found, if any.
+#
+# Adapted from tslove923/omarchy-howdy-face-unlock (MIT).
+#
+# Windows-Hello-style IR sensors normally expose a separate /dev/videoN node
+# that advertises only the GREY pixel format. That is a reliable signature
+# across vendors. Prefer a stable /dev/v4l/by-id/ symlink so the path survives
+# reboots and USB re-enumeration.
+set -u
+
+command -v v4l2-ctl >/dev/null 2>&1 || exit 1
+
+stable_path_for() {
+  local target real link dir
+  target=$(readlink -f "$1")
+  # Prefer a USB serial (by-id); fall back to the PCI/USB topology (by-path).
+  for dir in /dev/v4l/by-id /dev/v4l/by-path; do
+    for link in "$dir"/*; do
+      [[ -e $link ]] || continue
+      real=$(readlink -f "$link")
+      if [[ $real == "$target" ]]; then
+        echo "$link"
+        return 0
+      fi
+    done
+  done
+  echo "$1"
+}
+
+for dev in /dev/video*; do
+  [[ -c $dev ]] || continue
+
+  formats=$(v4l2-ctl -d "$dev" --list-formats 2>/dev/null |
+    grep -oE "'[A-Za-z0-9]{4}'" | tr -d "'")
+  [[ -z $formats ]] && continue
+
+  if [[ $(wc -l <<<"$formats") -eq 1 && $formats == "GREY" ]]; then
+    stable_path_for "$dev"
+    exit 0
+  fi
+done
+
+exit 1

@@ -1,0 +1,476 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+"""Add Howdy face unlock to the grantabell fingerprint-on-enter lock clone.
+
+The howdy-face-unlock plugin only patches the package-owned stock lock
+(/usr/share/omarchy/shell/plugins/lock/Service.qml).  This clone is a
+separate, user-owned Service.qml, so the stock patch never reaches it.
+
+The clone intentionally differs from upstream in two places:
+  * handleFingerprintFinished() does not auto-restart on a timeout (that is
+    the plugin's anti-overheating feature), and
+  * fingerprintPam.onError() does not restart the reader.
+This script keeps that behaviour and adds:
+  * the Howdy PAM path, retry budget and presence window from the plugin,
+  * a short error-only fingerprint retry, for the resume race where fprintd
+    reports "Cannot run while suspended" before the sensor is back.
+
+Safe to re-run; it refuses to apply partially.
+
+Tested with GrantAbell/Omarchy-Lock-Fingerprint-on-Enter commit e887095.
+Set GRANTABELL_LOCK_DIR to point at a different plugin checkout, or pass
+the Service.qml path as the first argument.
+"""
+import os
+import sys
+from pathlib import Path
+
+DEFAULT_PLUGIN_DIR = Path(
+    os.environ.get(
+        "GRANTABELL_LOCK_DIR",
+        Path.home() / ".config/omarchy/plugins/grantabell.lock-fingerprint-on-enter",
+    )
+)
+DEFAULT_QML = DEFAULT_PLUGIN_DIR / "Service.qml"
+
+PATCHES = [
+    # Properties.
+    (
+        "  property bool authenticatingPassword: false\n"
+        "  property bool fingerprintAuthenticating: false\n"
+        "  property bool passwordPamConfigured: false\n"
+        "  property bool fingerprintConfigured: false\n",
+        "  property bool authenticatingPassword: false\n"
+        "  property bool fingerprintAuthenticating: false\n"
+        "  property bool howdyAuthenticating: false\n"
+        "  property bool passwordPamConfigured: false\n"
+        "  property bool fingerprintConfigured: false\n"
+        "  property bool howdyConfigured: false\n"
+        "  property int howdyAttempts: 0\n"
+        "  property bool howdyFaceLockedOut: false\n"
+        "  property bool howdyRetryPaused: false\n"
+        "  property double howdyLastActivityAt: 0\n"
+        "  property double howdyAttemptStartedAt: 0\n"
+        "  readonly property int maxFaceAttempts: 3\n"
+        "  readonly property int howdyActiveWindowMs: 10000\n"
+        "  property bool faceUnlockEnabled: true\n"
+        "  property int fingerprintErrorRetries: 0\n"
+        "  property int fingerprintCheckRetries: 0\n",
+    ),
+    (
+        "  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating\n",
+        "  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating || howdyAuthenticating\n",
+    ),
+    # Howdy status check hook.
+    (
+        "  function refreshFingerprintStatus() {\n"
+        "    if (!fingerprintCheckProc.running) fingerprintCheckProc.running = true\n"
+        "  }\n",
+        "  function refreshFingerprintStatus() {\n"
+        "    if (!fingerprintCheckProc.running) fingerprintCheckProc.running = true\n"
+        "  }\n"
+        "\n"
+        "  function refreshHowdyStatus() {\n"
+        "    if (!howdyCheckProc.running) howdyCheckProc.running = true\n"
+        "  }\n"
+        "\n"
+        "  function refreshFaceUnlockEnabled() {\n"
+        "    if (!faceUnlockCheckProc.running) faceUnlockCheckProc.running = true\n"
+        "  }\n",
+    ),
+    # Reset state.
+    (
+        "    authenticatingPassword = false\n"
+        "    fingerprintAuthenticating = false\n"
+        "    fingerprintRetryTimer.stop()\n"
+        "    if (passwordPam.active) passwordPam.abort()\n"
+        "    if (fingerprintPam.active) fingerprintPam.abort()\n"
+        "  }\n",
+        "    authenticatingPassword = false\n"
+        "    fingerprintAuthenticating = false\n"
+        "    howdyAuthenticating = false\n"
+        "    howdyAttempts = 0\n"
+        "    howdyFaceLockedOut = false\n"
+        "    howdyRetryPaused = false\n"
+        "    howdyAttemptStartedAt = 0\n"
+        "    fingerprintErrorRetries = 0\n"
+        "    fingerprintCheckRetries = 0\n"
+        "    fingerprintRetryTimer.stop()\n"
+        "    fingerprintErrorRetryTimer.stop()\n"
+        "    fingerprintCheckRetryTimer.stop()\n"
+        "    howdyRetryTimer.stop()\n"
+        "    if (passwordPam.active) passwordPam.abort()\n"
+        "    if (fingerprintPam.active) fingerprintPam.abort()\n"
+        "    if (howdyPam.active) howdyPam.abort()\n"
+        "  }\n",
+    ),
+    # Refresh face status when the lock starts.
+    (
+        "    Qt.callLater(function() {\n"
+        "      root.refreshBackground()\n"
+        "      root.refreshFingerprintStatus()\n"
+        "    })\n",
+        "    Qt.callLater(function() {\n"
+        "      root.refreshBackground()\n"
+        "      root.refreshFingerprintStatus()\n"
+        "      root.refreshHowdyStatus()\n"
+        "      root.refreshFaceUnlockEnabled()\n"
+        "    })\n",
+    ),
+    # Presence window + resume after pause/lockout.
+    (
+        "  function runWake() {\n"
+        "    if (!wakeProcess.running) wakeProcess.running = true\n"
+        "    if (lockRequested) armBlankTimer()\n"
+        "  }\n",
+        "  function runWake() {\n"
+        "    if (!wakeProcess.running) wakeProcess.running = true\n"
+        "    if (lockRequested) armBlankTimer()\n"
+        "\n"
+        "    // Real wake activity means someone is at the machine.  Keep the\n"
+        "    // Howdy retry cycle alive, and give a paused/locked-out face auth a\n"
+        "    // clean restart on the transition only (not on every mouse move).\n"
+        "    if (lockRequested && howdyConfigured && faceUnlockEnabled) {\n"
+        "      howdyLastActivityAt = Date.now()\n"
+        "      // Once the three face attempts are spent, keep them spent until this\n"
+        "      // lock session ends: mouse/keyboard activity must not silently grant\n"
+        "      // another three. Only a pause caused by nobody being present resumes.\n"
+        "      if (howdyRetryPaused && !howdyFaceLockedOut) {\n"
+        "        // Keep howdyAttempts: a pause must not refill the three-attempt\n"
+        "        // budget. Only a new lock session resets it.\n"
+        "        howdyRetryPaused = false\n"
+        "        howdyRetryTimer.stop()\n"
+        "        logEvent(\"howdy-resumed: wake\")\n"
+        "        startHowdy()\n"
+        "      }\n"
+        "    }\n"
+        "  }\n",
+    ),
+    # Enter with an empty field is the plugin's manual fingerprint restart;
+    # let it also clear a exhausted error-retry budget.
+    (
+        "      if (password.length === 0) {\n"
+        "          runWake()\n"
+        "          startFingerprint()\n"
+        "          return\n"
+        "      }\n",
+        "      if (password.length === 0) {\n"
+        "          runWake()\n"
+        "          fingerprintErrorRetries = 0\n"
+        "          startFingerprint()\n"
+        "          return\n"
+        "      }\n",
+    ),
+    # Keep the clone's no-auto-retry-on-timeout behaviour, but reset the
+    # error-only counter, then add the Howdy functions.
+    (
+        "  function handleFingerprintFinished(result) {\n"
+        "      fingerprintAuthenticating = false\n"
+        "      if (!lockRequested) return\n"
+        "\n"
+        "      if (result === PamResult.Success) {\n"
+        "          finishUnlock()\n"
+        "      }\n"
+        "  }\n",
+        "  function handleFingerprintFinished(result) {\n"
+        "      fingerprintAuthenticating = false\n"
+        "      if (!lockRequested) return\n"
+        "\n"
+        "      if (result === PamResult.Success) {\n"
+        "          finishUnlock()\n"
+        "      }\n"
+        "  }\n"
+        "\n"
+        "  function startHowdy() {\n"
+        "    if (!faceUnlockEnabled) return\n"
+        "    if (!lockRequested || !sessionLock.secure || !howdyConfigured) return\n"
+        "    if (howdyPam.active || howdyAuthenticating) return\n"
+        "    if (howdyFaceLockedOut) return\n"
+        "    if (howdyRetryPaused) return\n"
+        "    if (authenticatingPassword) return\n"
+        "\n"
+        "    howdyRetryPaused = false\n"
+        "    howdyAuthenticating = true\n"
+        "    howdyAttemptStartedAt = Date.now()\n"
+        "    if (!howdyPam.start()) {\n"
+        "      howdyAuthenticating = false\n"
+        "      howdyAttemptStartedAt = 0\n"
+        "    }\n"
+        "  }\n"
+        "\n"
+        "  function howdyRecentlyActive() {\n"
+        "    return Date.now() - howdyLastActivityAt <= howdyActiveWindowMs\n"
+        "  }\n"
+        "\n"
+        "  function scheduleHowdyRetry() {\n"
+        "    if (howdyRecentlyActive()) {\n"
+        "      howdyRetryTimer.restart()\n"
+        "    } else {\n"
+        "      howdyRetryPaused = true\n"
+        "      logEvent(\"howdy-paused: no-recent-activity\")\n"
+        "    }\n"
+        "  }\n"
+        "\n"
+        "  function handleHowdyFinished(result) {\n"
+        "    howdyAuthenticating = false\n"
+        "\n"
+        "    if (!lockRequested) return\n"
+        "    if (result === PamResult.Success) {\n"
+        "      finishUnlock()\n"
+        "      return\n"
+        "    }\n"
+        "    if (!howdyConfigured) return\n"
+        "\n"
+        "    var elapsed = howdyAttemptStartedAt > 0 ? Date.now() - howdyAttemptStartedAt : 0\n"
+        "    howdyAttemptStartedAt = 0\n"
+        "\n"
+        "    // A result that comes back almost immediately means the helper did not\n"
+        "    // actually scan (lid closed, camera busy, PAM misconfigured). Do not\n"
+        "    // spend one of the three face attempts on that; pause until the next\n"
+        "    // activity instead.\n"
+        "    if (elapsed < 1000) {\n"
+        "      howdyRetryPaused = true\n"
+        "      logEvent(\"howdy-paused: quick-result\")\n"
+        "      return\n"
+        "    }\n"
+        "\n"
+        "    howdyAttempts += 1\n"
+        "    if (howdyAttempts >= maxFaceAttempts) {\n"
+        "      howdyFaceLockedOut = true\n"
+        "      logEvent(\"howdy-locked-out: attempts=\" + howdyAttempts)\n"
+        "      failureMessage = \"Too many face attempts \\u2014 use your password\"\n"
+        "      return\n"
+        "    }\n"
+        "    scheduleHowdyRetry()\n"
+        "  }\n",
+    ),
+    # Start face auth when the session lock becomes secure.
+    (
+        "        pendingSessionLockTimer.stop()\n"
+        "        root.startFingerprint()\n"
+        "      }\n"
+        "    }\n",
+        "        pendingSessionLockTimer.stop()\n"
+        "        root.startFingerprint()\n"
+        "        root.howdyLastActivityAt = Date.now()\n"
+        "        root.howdyRetryPaused = false\n"
+        "        root.startHowdy()\n"
+        "      }\n"
+        "    }\n",
+    ),
+    # Fingerprint errors (sensor still suspended after resume, release race)
+    # get a few spaced retries.  Timeouts are still left alone.
+    (
+        "    onError: function(error) {\n"
+        "      root.fingerprintAuthenticating = false\n"
+        "    }\n"
+        "  }\n"
+        "  Timer {\n"
+        "    id: fingerprintRetryTimer\n"
+        "    interval: 250\n"
+        "    repeat: false\n"
+        "    onTriggered: root.startFingerprint()\n"
+        "  }\n"
+        "\n"
+        "  Process {\n"
+        "    id: readlinkProc\n",
+        "    onError: function(error) {\n"
+        "      root.fingerprintAuthenticating = false\n"
+        "      if (!root.lockRequested || !root.fingerprintConfigured) return\n"
+        "      // fprintd can be briefly unavailable right after resume\n"
+        "      // (\"Cannot run while suspended\") or while it releases a device.\n"
+        "      // Retry that error a couple of times; a real timeout is still\n"
+        "      // left alone for the plugin's anti-overheating behaviour.\n"
+        "      if (root.fingerprintErrorRetries < 3) {\n"
+        "        root.fingerprintErrorRetries += 1\n"
+        "        fingerprintErrorRetryTimer.restart()\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  Timer {\n"
+        "    id: fingerprintRetryTimer\n"
+        "    interval: 250\n"
+        "    repeat: false\n"
+        "    onTriggered: root.startFingerprint()\n"
+        "  }\n"
+        "\n"
+        "  Timer {\n"
+        "    id: fingerprintErrorRetryTimer\n"
+        "    interval: 2000\n"
+        "    repeat: false\n"
+        "    onTriggered: root.startFingerprint()\n"
+        "  }\n"
+        "\n"
+        "  PamContext {\n"
+        "    id: howdyPam\n"
+        "    config: \"omarchy-lock-howdy\"\n"
+        "    user: root.userName\n"
+        "\n"
+        "    onCompleted: function(result) {\n"
+        "      root.handleHowdyFinished(result)\n"
+        "    }\n"
+        "\n"
+        "    onError: function(error) {\n"
+        "      root.howdyAuthenticating = false\n"
+        "      root.howdyAttemptStartedAt = 0\n"
+        "      if (!root.lockRequested || !root.howdyConfigured || root.howdyFaceLockedOut) return\n"
+        "\n"
+        "      // Do not count PAM-level errors as face attempts: the helper may have\n"
+        "      // bailed out before scanning (for example, the lid was closed). Pause\n"
+        "      // and let the next mouse/keyboard activity try again instead of\n"
+        "      // burning through the three-attempt budget in a retry loop.\n"
+        "      root.howdyRetryPaused = true\n"
+        "      root.logEvent(\"howdy-paused: pam-error\")\n"
+        "    }\n"
+        "  }\n"
+        "\n"
+        "  Timer {\n"
+        "    id: howdyRetryTimer\n"
+        "    interval: 250\n"
+        "    repeat: false\n"
+        "    onTriggered: root.startHowdy()\n"
+        "  }\n"
+        "\n"
+        "  Process {\n"
+        "    id: readlinkProc\n",
+    ),
+    # Fingerprint check: keep a working reader visible through the resume
+    # window, then add the Howdy asset check.
+    (
+        "      root.fingerprintConfigured = String(fingerprintCheckStdout.text || \"\").trim() === \"yes\"\n"
+        "      if (root.lockRequested && root.fingerprintConfigured) root.startFingerprint()\n"
+        "      else if (!root.fingerprintConfigured && fingerprintPam.active) fingerprintPam.abort()\n"
+        "    }\n"
+        "  }\n"
+        "\n"
+        "  Process {\n"
+        "    id: strandedLockCheckProc\n",
+        "      const enrolled = String(fingerprintCheckStdout.text || \"\").trim() === \"yes\"\n"
+        "      if (enrolled) {\n"
+        "        root.fingerprintConfigured = true\n"
+        "        root.fingerprintCheckRetries = 0\n"
+        "        if (root.lockRequested) root.startFingerprint()\n"
+        "      } else if (root.fingerprintCheckRetries < 5 && (root.lockRequested || root.previewVisible)) {\n"
+        "        // fprintd can report \"Cannot run while suspended\" for a few\n"
+        "        // seconds after resume.  Do not hide a working reader over that.\n"
+        "        root.fingerprintCheckRetries += 1\n"
+        "        fingerprintCheckRetryTimer.restart()\n"
+        "      } else {\n"
+        "        root.fingerprintConfigured = false\n"
+        "        if (fingerprintPam.active) fingerprintPam.abort()\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "\n"
+        "  Timer {\n"
+        "    id: fingerprintCheckRetryTimer\n"
+        "    interval: 2000\n"
+        "    repeat: false\n"
+        "    onTriggered: root.refreshFingerprintStatus()\n"
+        "  }\n"
+        "\n"
+        "  Process {\n"
+        "    id: faceUnlockCheckProc\n"
+        "    command: [\"bash\", \"-c\", \"[[ -e \\\"$HOME/.config/omarchy/face-unlock-disabled\\\" ]] && echo no || echo yes\"]\n"
+        "    stdout: StdioCollector { id: faceUnlockCheckStdout; waitForEnd: true }\n"
+        "    onExited: {\n"
+        "      root.faceUnlockEnabled = String(faceUnlockCheckStdout.text || \"\").trim() === \"yes\"\n"
+        "      if (!root.faceUnlockEnabled && howdyPam.active) howdyPam.abort()\n"
+        "      else if (root.faceUnlockEnabled && root.lockRequested && root.howdyConfigured) root.startHowdy()\n"
+        "    }\n"
+        "  }\n"
+        "\n"
+        "  Process {\n"
+        "    id: howdyCheckProc\n"
+        "    // Only trust Howdy assets the session cannot rewrite: the PAM\n"
+        "    // service, the face model and the PAM module must all be root-owned\n"
+        "    // and not group/world-writable.\n"
+        "    command: [\"bash\", \"-c\", [\n"
+        "      \"p=/etc/pam.d/omarchy-lock-howdy\",\n"
+        "      \"m=/etc/howdy/models/${USER}.dat\",\n"
+        "      \"mod=/usr/lib/security/pam_howdy.so; [[ -f $mod ]] || mod=/lib/security/pam_howdy.so\",\n"
+        "      \"[[ -f $p && -f $m && -f $mod ]] || { echo no; exit 0; }\",\n"
+        "      \"[[ $(stat -c %u $p) == 0 && $(stat -c %u $m) == 0 && $(stat -c %u $mod) == 0 ]] || { echo no; exit 0; }\",\n"
+        "      \"[[ -z $(find $p $m $mod -perm /go+w -print -quit) ]] || { echo no; exit 0; }\",\n"
+        "      \"echo yes\"\n"
+        "    ].join(\"; \")]\n"
+        "    stdout: StdioCollector { id: howdyCheckStdout; waitForEnd: true }\n"
+        "    onExited: {\n"
+        "      root.howdyConfigured = String(howdyCheckStdout.text || \"\").trim() === \"yes\"\n"
+        "      if (root.lockRequested && root.howdyConfigured && root.faceUnlockEnabled) root.startHowdy()\n"
+        "      else if (!root.howdyConfigured) { if (howdyPam.active) howdyPam.abort(); howdyRetryTimer.stop() }\n"
+        "    }\n"
+        "  }\n"
+        "\n"
+        "  Process {\n"
+        "    id: strandedLockCheckProc\n",
+    ),
+    # Startup + status + preview.
+    (
+        "  Component.onCompleted: {\n"
+        "    refreshBackground()\n"
+        "    refreshFingerprintStatus()\n"
+        "    checkStrandedLock()\n"
+        "  }\n",
+        "  Component.onCompleted: {\n"
+        "    refreshBackground()\n"
+        "    refreshFingerprintStatus()\n"
+        "    refreshHowdyStatus()\n"
+        "    refreshFaceUnlockEnabled()\n"
+        "    checkStrandedLock()\n"
+        "  }\n",
+    ),
+    (
+        "        passwordPam: root.passwordPamConfigured,\n"
+        "        fingerprint: root.fingerprintConfigured,\n"
+        "        authenticating: root.authenticating,\n",
+        "        passwordPam: root.passwordPamConfigured,\n"
+        "        fingerprint: root.fingerprintConfigured,\n"
+        "        howdy: root.howdyConfigured,\n"
+        "        howdyPaused: root.howdyRetryPaused,\n"
+        "        faceUnlock: root.faceUnlockEnabled,\n"
+        "        authenticating: root.authenticating,\n",
+    ),
+    (
+        "    function preview(): string {\n"
+        "      root.refreshBackground()\n"
+        "      root.refreshFingerprintStatus()\n"
+        "      root.previewVisible = true\n"
+        "      return \"ok\"\n"
+        "    }\n",
+        "    function preview(): string {\n"
+        "      root.refreshBackground()\n"
+        "      root.refreshFingerprintStatus()\n"
+        "      root.refreshHowdyStatus()\n"
+        "      root.refreshFaceUnlockEnabled()\n"
+        "      root.previewVisible = true\n"
+        "      return \"ok\"\n"
+        "    }\n",
+    ),
+]
+
+
+def main():
+    path = sys.argv[1] if len(sys.argv) > 1 else str(DEFAULT_QML)
+    with open(path, "r") as f:
+        text = f.read()
+
+    if "omarchy-lock-howdy" in text:
+        print("Already patched, nothing to do.")
+        return 0
+
+    for i, (old, new) in enumerate(PATCHES, 1):
+        count = text.count(old)
+        if count != 1:
+            print(f"Patch {i} anchor matched {count} times (expected 1); aborting without changes.", file=sys.stderr)
+            return 1
+        text = text.replace(old, new, 1)
+
+    with open(path, "w") as f:
+        f.write(text)
+    print(f"Patched {path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

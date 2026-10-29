@@ -1,0 +1,143 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Check the installed lock-screen face unlock, capture watcher and Telegram
+# configuration. Exits non-zero if a required part is missing.
+set -u
+
+PLUGIN_ID="grantabell.lock-fingerprint-on-enter"
+PLUGIN_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$PLUGIN_ID"
+PAM_FILE="/etc/pam.d/omarchy-lock-howdy"
+MODEL="/etc/howdy/models/${USER}.dat"
+MODULE="/usr/lib/security/pam_howdy.so"
+[[ -f $MODULE ]] || MODULE="/lib/security/pam_howdy.so"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/howdy-attempt-capture"
+ENV_FILE="$CONFIG_DIR/telegram.env"
+SERVICE="howdy-attempt-capture.service"
+failed=0
+
+ok() { printf '  ok    %s\n' "$*"; }
+bad() { printf '  FAIL  %s\n' "$*"; failed=$((failed + 1)); }
+note() { printf '  note  %s\n' "$*"; }
+
+echo "Plugin"
+if [[ -d $PLUGIN_DIR ]]; then
+  ok "plugin directory: $PLUGIN_DIR"
+else
+  bad "plugin directory missing: $PLUGIN_DIR"
+fi
+
+if command -v omarchy >/dev/null 2>&1; then
+  enabled=$(omarchy plugin list --json 2>/dev/null |
+    jq -r --arg id "$PLUGIN_ID" '.[] | select(.id == $id) | .enabled' 2>/dev/null || true)
+  if [[ $enabled == true ]]; then
+    ok "plugin enabled"
+  else
+    bad "plugin is not enabled (state: ${enabled:-unknown})"
+  fi
+else
+  bad "omarchy command not found"
+fi
+
+if [[ -f $PLUGIN_DIR/Service.qml ]]; then
+  if grep -q 'omarchy-lock-howdy' "$PLUGIN_DIR/Service.qml"; then
+    ok "Service.qml has the Howdy integration"
+  else
+    bad "Service.qml is not patched (run: grantabell-howdy-patch)"
+  fi
+  if grep -q 'maxFaceAttempts: 3' "$PLUGIN_DIR/Service.qml"; then
+    ok "face attempt limit is 3"
+  else
+    bad "face attempt limit is not 3"
+  fi
+  if grep -q 'omarchy/face-unlock-disabled' "$PLUGIN_DIR/Service.qml"; then
+    ok "runtime face-unlock marker supported"
+  else
+    bad "runtime face-unlock marker support missing"
+  fi
+else
+  bad "Service.qml missing"
+fi
+
+echo "Howdy / PAM"
+for path in "$PAM_FILE" "$MODEL" "$MODULE"; do
+  if [[ -e $path ]]; then
+    ok "exists: $path"
+    owner=$(stat -c %u "$path" 2>/dev/null || echo "?")
+    if [[ $owner == 0 ]]; then
+      ok "root-owned: $path"
+    else
+      bad "not root-owned: $path"
+    fi
+    if [[ -z $(find "$path" -perm /go+w -print -quit 2>/dev/null) ]]; then
+      ok "not group/world-writable: $path"
+    else
+      bad "group/world-writable: $path"
+    fi
+  else
+    bad "missing: $path"
+  fi
+done
+
+if [[ -f $PAM_FILE ]] && grep -q 'pam_howdy.so' "$PAM_FILE"; then
+  ok "PAM service runs pam_howdy.so"
+else
+  bad "PAM service does not reference pam_howdy.so"
+fi
+
+echo "Watcher"
+if systemctl --user is-active --quiet "$SERVICE"; then
+  ok "$SERVICE is active"
+else
+  bad "$SERVICE is not active"
+fi
+if command -v journalctl >/dev/null 2>&1 && journalctl -n0 >/dev/null 2>&1; then
+  ok "journal is readable by $USER"
+else
+  bad "journal is not readable (add $USER to the systemd-journal group)"
+fi
+
+echo "Shell status"
+if command -v omarchy-shell >/dev/null 2>&1; then
+  status=$(omarchy-shell lock status 2>/dev/null || true)
+  if jq -e '.faceUnlock == true and .howdy == true' >/dev/null 2>&1 <<<"$status"; then
+    ok "faceUnlock and howdy are available"
+  else
+    bad "faceUnlock/howdy not available: ${status:-no status}"
+  fi
+  if jq -e '.fingerprint == true and .passwordPam == true' >/dev/null 2>&1 <<<"$status"; then
+    ok "fingerprint and password PAM are available"
+  else
+    note "fingerprint or password PAM is not available"
+  fi
+else
+  bad "omarchy-shell not found"
+fi
+
+echo "Telegram (optional)"
+if [[ -r $ENV_FILE ]]; then
+  mode=$(stat -c %a "$ENV_FILE" 2>/dev/null || echo "?")
+  if [[ $mode == 600 ]]; then
+    ok "config exists with mode 600"
+  else
+    bad "config mode is $mode (expected 600)"
+  fi
+  if grep -q '^TELEGRAM_BOT_TOKEN=.' "$ENV_FILE" && grep -q '^TELEGRAM_CHAT_ID=.' "$ENV_FILE"; then
+    ok "token and chat ID are set"
+  else
+    bad "token or chat ID is empty"
+  fi
+else
+  note "not configured; photos are kept locally only"
+fi
+
+if [[ -d ${HOWDY_ATTEMPT_PHOTO_DIR:-$HOME/Pictures/lock-attempts} ]]; then
+  ok "photo directory exists"
+else
+  note "photo directory does not exist yet (created on first capture)"
+fi
+
+if ((failed > 0)); then
+  printf '\n%d check(s) failed.\n' "$failed"
+  exit 1
+fi
+printf '\nAll required checks passed.\n'
